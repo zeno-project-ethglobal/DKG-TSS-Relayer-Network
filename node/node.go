@@ -35,6 +35,12 @@ import (
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/std/hash/mimc"
+
+	"context"
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 // ---------- Types ----------
@@ -77,6 +83,8 @@ type BatchApproval struct {
 	Sig       string `json:"sig"` // signature of BatchHash
 }
 
+var contractABI = `[{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"is2FARequired","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"}]`
+
 // ---------- Globals ----------
 var (
 	peerMap     = make(map[string]string)
@@ -112,13 +120,29 @@ var (
 	signGroupParts []string
 
 	// relayer
-	stakeFile    string
-	roundCounter int64
-	batchNonce   uint64
-	approvalLock sync.Mutex
-	approvals    = make(map[string][]BatchApproval) // key = batchHash
+	stakeFile      string
+	roundCounter   int64
+	batchNonce     uint64
+	approvalLock   sync.Mutex
+	approvals      = make(map[string][]BatchApproval) // key = batchHash
+	ISSUER_ADDRESS = "0x7678D7C93aa0A43A8eE8Bbb782D6a42bc80f15CA"
 
+	RELAYER_CONTRACT = "0x29515e3A4F2393c06264Fe406083bAF8F4Cc8210"
+	// ZENOPAY_CONTRACT = "0xBe0633404b3Ea76A89786ea072c989b2b31b8d9c"
+	myRelayerPrivKey *ecdsa.PrivateKey
 )
+
+func loadRelayerPrivKey() *ecdsa.PrivateKey {
+	pkHex := os.Getenv("RELAYER_PRIVKEY")
+	if pkHex == "" {
+		log.Fatal("RELAYER_PRIVKEY not set in environment")
+	}
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(pkHex, "0x"))
+	if err != nil {
+		log.Fatalf("Failed to parse private key: %v", err)
+	}
+	return key
+}
 
 // ---------- File Persistence ----------
 func loadPeers() map[string]string {
@@ -528,15 +552,157 @@ func handleP2PConnection(conn net.Conn) {
 
 		fmt.Printf("🧹 Removed %d txs from mempool after BATCH_CONFIRMED %s\n", len(txHashesIface), batchHash)
 
+	case "PASSWORD_RECOVERY":
+		b, _ := json.Marshal(msg.Data)
+		rec := map[string]interface{}{}
+		_ = json.Unmarshal(b, &rec)
+
+		id := rec["id"].(string)
+		newEOA := rec["new_eoa_from_password"].(string)
+		v := rec["v"]
+		r := rec["r"]
+		s := rec["s"]
+
+		// verify signature again
+		message := "PASSWORD RECOVERY" + id + newEOA
+		msgHash := crypto.Keccak256Hash([]byte(message))
+		ok, err := verifyRawSignature(msgHash, ISSUER_ADDRESS, v, r, s)
+		if err != nil || !ok {
+			fmt.Println("❌ Invalid PASSWORD_RECOVERY sig from peer")
+			return
+		}
+
+		// update users.json
+		users := loadUsers()
+		for addr, entry := range users {
+			if entry["id"] == id {
+				entry["eoa_from_password"] = newEOA
+				users[addr] = entry
+				fmt.Printf("🔑 Password recovery applied for user %s → new EOA %s\n", id, newEOA)
+				break
+			}
+		}
+		saveUsersMap(users)
+
 	}
 }
 
 // ---------- Relayer Helpers ----------
 func computeBatchHash(items []map[string]interface{}) string {
-	b, _ := json.Marshal(items)
 	h := sha3.NewLegacyKeccak256()
-	h.Write(b)
+	for _, tx := range items {
+		// deterministic concatenation of tx fields
+		from := common.HexToAddress(tx["from"].(string))
+		to := common.HexToAddress(tx["to"].(string))
+		value := new(big.Int)
+		value.SetString(tx["value"].(string), 10)
+		data := common.FromHex(tx["data"].(string))
+
+		h.Write(from.Bytes())
+		h.Write(to.Bytes())
+		h.Write(value.FillBytes(make([]byte, 32)))
+		h.Write(data)
+
+		if sig, ok := tx["signature"].(map[string]interface{}); ok {
+			r := common.FromHex(sig["r"].(string))
+			s := common.FromHex(sig["s"].(string))
+			v := byte(int(sig["v"].(float64)))
+			h.Write(r)
+			h.Write(s)
+			h.Write([]byte{v})
+		}
+	}
 	return "0x" + hex.EncodeToString(h.Sum(nil))
+}
+
+func relayBatchToChain(batch []map[string]interface{}, contractAddr string, privKey *ecdsa.PrivateKey) error {
+	client, err := ethclient.Dial("https://sepolia.infura.io/v3/<YOUR_KEY>")
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	parsedABI, err := getRelayerABI()
+	if err != nil {
+		return err
+	}
+
+	// Go struct matching the tuple
+	var txStructs []struct {
+		From  common.Address
+		To    common.Address
+		Value *big.Int
+		Data  []byte
+		V     uint8
+		R     [32]byte
+		S     [32]byte
+	}
+
+	for _, item := range batch {
+		from := common.HexToAddress(item["from"].(string))
+		to := common.HexToAddress(item["to"].(string))
+		val := new(big.Int)
+		val.SetString(item["value"].(string), 10)
+		data := common.FromHex(item["data"].(string))
+
+		sig := item["signature"].(map[string]interface{})
+		v := uint8(sig["v"].(float64))
+		rBytes := common.FromHex(sig["r"].(string))
+		sBytes := common.FromHex(sig["s"].(string))
+
+		var r32, s32 [32]byte
+		copy(r32[32-len(rBytes):], rBytes)
+		copy(s32[32-len(sBytes):], sBytes)
+
+		txStructs = append(txStructs, struct {
+			From  common.Address
+			To    common.Address
+			Value *big.Int
+			Data  []byte
+			V     uint8
+			R     [32]byte
+			S     [32]byte
+		}{from, to, val, data, v, r32, s32})
+	}
+
+	input, err := parsedABI.Pack("sendBatch", txStructs)
+	if err != nil {
+		return err
+	}
+
+	chainID, _ := client.NetworkID(context.Background())
+	signer := types.NewEIP155Signer(chainID)
+	fromAddr := crypto.PubkeyToAddress(privKey.PublicKey)
+
+	nonce, _ := client.PendingNonceAt(context.Background(), fromAddr)
+	gasPrice, _ := client.SuggestGasPrice(context.Background())
+
+	toAddr := common.HexToAddress(contractAddr)
+
+	msg := ethereum.CallMsg{From: fromAddr, To: &toAddr, Data: input}
+
+	gasLimit, err := client.EstimateGas(context.Background(), msg)
+	if err != nil {
+		gasLimit = 1_000_000 // fallback
+	}
+
+	tx := types.NewTransaction(nonce, toAddr, big.NewInt(0), gasLimit, gasPrice, input)
+	signedTx, _ := types.SignTx(tx, signer, privKey)
+	return client.SendTransaction(context.Background(), signedTx)
+}
+
+func getRelayerABI() (abi.ABI, error) {
+	data, err := os.ReadFile("./abi/relayercontract.json")
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to read ABI file: %w", err)
+	}
+
+	parsedABI, err := abi.JSON(strings.NewReader(string(data)))
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to parse ABI: %w", err)
+	}
+
+	return parsedABI, nil
 }
 
 func signBatchHash(hash string) string {
@@ -547,7 +713,7 @@ func signBatchHash(hash string) string {
 
 // ---------- Relayer Flow ----------
 func startRelayer() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
 		roundCounter++
 
@@ -616,6 +782,12 @@ func startRelayer() {
 			}
 
 			// TODO: Call on-chain contract here
+			err := relayBatchToChain(batch, RELAYER_CONTRACT, myRelayerPrivKey)
+			if err != nil {
+				fmt.Println("❌ Relay failed:", err)
+			} else {
+				fmt.Println("✅ Batch relayed to contract")
+			}
 
 		} else {
 			fmt.Println("❌ Not enough approvals, skipping batch", hash)
@@ -1095,7 +1267,7 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 
 			1. tx details (from would be eoa from password)
 			2. 2FA base64 only if tx value > 10 dollar
-			3. signature (2FA + tx)
+			3. signature (tx) with eoa from password
 			process -> verify signature + verify 2FA and start process
 
 		*/
@@ -1106,38 +1278,68 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		tx := req.Params[0].(map[string]interface{})
 		from := tx["from"].(string)
-		// txValue := tx["value"].(string)
+		valueStr := tx["value"].(string)
+
 		users := loadUsers()
-		if users[from] == nil {
+		userEntry := users[from]
+		if userEntry == nil {
 			resp.Error = "no entry for this from address"
 			break
 		}
-		// if txValue > users[from].value_thershold {
-		// 	// we need the 2FA
-		// }
 
-		// proof := decodeProofBase64(tx["2fa"].(string))
-		// timestep := getTimeStep()
+		// parse tx value
+		to := tx["to"].(string)
+		data := tx["data"].(string)
+		need2FA, err := callIs2FARequired(from, valueStr, data, to)
+		if err != nil {
+			resp.Error = fmt.Sprintf("is2FARequired contract call failed: %v", err)
+			break
+		}
 
-		// v := tx["v"]
-		// r := tx["r"]
-		// s := tx["s"]
+		if need2FA {
+			proofB64, ok := tx["proof"].(string)
+			if !ok || proofB64 == "" {
+				resp.Error = "2FA proof required for this transaction"
+				break
+			}
 
-		// tx data like (from to value data) should be signed by eoa_from_password
+			proof := decodeProofBase64(proofB64)
+			commitment := userEntry["commitment"].(string)
+			timestep := getTimeStep()
 
-		// vk := loadVK()
-		// publicAssign := zkTOTPCircuit{Commitment: commitment, TimeStep: timestep}
-		// publicWitness, _ := frontend.NewWitness(&publicAssign, ecc.BN254.ScalarField(), frontend.PublicOnly())
+			if err := verify2FA(proof, commitment, timestep); err != nil {
+				resp.Error = fmt.Sprintf("2FA verification failed: %v", err)
+				break
+			}
+			fmt.Println("[Node] 2FA verification SUCCESS ✅")
+		}
+		// --- tx signature check ---
+		v := tx["v"]
+		r := tx["r"]
+		s := tx["s"]
 
-		// if err := groth16.Verify(proof, *vk, publicWitness); err != nil {
-		// 	// send failed response
+		// message = keccak256(from || to || value || data)
+		digest := computeTxHash(tx)
 
-		// 	break
-		// }
-		fmt.Println("[Node] Verification SUCCESS ✅")
+		ok, err := verifyRawSignature(common.HexToHash(digest), userEntry["eoa_from_password"].(string), v, r, s)
+		if err != nil {
+			resp.Error = fmt.Sprintf("signature verification failed: %v", err)
+			break
+		}
+		if !ok {
+			resp.Error = "invalid signature: recovered EOA mismatch"
+			break
+		}
+		fmt.Println("[Node] Tx signature verified ✅ by", userEntry["eoa_from_password"])
 
+		cleanTx := map[string]interface{}{
+			"from":  tx["from"],
+			"to":    tx["to"],
+			"value": tx["value"],
+			"data":  tx["data"],
+		}
 		signLock.Lock()
-		signTx = tx
+		signTx = cleanTx
 		signFrom = from
 		signShares = make(map[string]*big.Int)
 		signResultCh = make(chan map[string]interface{}, 1)
@@ -1196,9 +1398,11 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 
 		var commitment string
 		found := false
-		for _, entry := range users {
+		var dkgEoA string
+		for dkg, entry := range users {
 			if entry["id"] == id {
 				commitment = entry["commitment"].(string)
+				dkgEoA = dkg
 				found = true
 				break
 			}
@@ -1221,6 +1425,72 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 		resp.Result = map[string]interface{}{
 			"status":  "login_success",
 			"message": "User authenticated successfully",
+			"dkg_eoa": dkgEoA,
+		}
+
+	case "recover_password":
+
+		if len(req.Params) < 1 {
+			resp.Error = "missing params"
+			break
+		}
+		data := req.Params[0].(map[string]interface{})
+		id := data["id"].(string)
+		newEOA := data["new_eoa_from_password"].(string)
+		v := data["v"]
+		r := data["r"]
+		s := data["s"]
+
+		// build recovery message
+		message := "PASSWORD RECOVERY" + id + newEOA
+		msgHash := crypto.Keccak256Hash([]byte(message))
+
+		// verify signature from ISSUER_ADDRESS
+		ok, err := verifyRawSignature(msgHash, ISSUER_ADDRESS, v, r, s)
+		if err != nil {
+			resp.Error = fmt.Sprintf("signature verification failed: %v", err)
+			break
+		}
+		if !ok {
+			resp.Error = "invalid signature: recovered address mismatch"
+			break
+		}
+
+		fmt.Println("✅ Password recovery request verified from ISSUER for user:", id)
+
+		// update locally
+		users := loadUsers()
+		found := false
+		for addr, entry := range users {
+			if entry["id"] == id {
+				entry["eoa_from_password"] = newEOA
+				users[addr] = entry
+				found = true
+				break
+			}
+		}
+		if !found {
+			resp.Error = fmt.Sprintf("no user found with id %s", id)
+			break
+		}
+		saveUsersMap(users)
+
+		// broadcast to peers
+		recoveryMsg := Message{
+			Command: "PASSWORD_RECOVERY",
+			Data: map[string]interface{}{
+				"id":                    id,
+				"new_eoa_from_password": newEOA,
+				"v":                     v, "r": r, "s": s,
+			},
+		}
+		for _, addr := range peerMap {
+			sendMessage(addr, recoveryMsg)
+		}
+
+		resp.Result = map[string]interface{}{
+			"status":  "password_recovery_success",
+			"message": "EOA updated across nodes",
 		}
 
 	default:
@@ -1229,6 +1499,51 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// callIs2FARequired queries the smart contract for 2FA requirement
+func callIs2FARequired(from string, valueStr string, data string, to string) (bool, error) {
+	client, err := ethclient.Dial("https://sepolia.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	if err != nil {
+		return false, fmt.Errorf("ethclient.Dial failed: %w", err)
+	}
+	defer client.Close()
+
+	parsedABI, err := abi.JSON(strings.NewReader(contractABI))
+	if err != nil {
+		return false, fmt.Errorf("parse ABI failed: %w", err)
+	}
+
+	value := new(big.Int)
+	value.SetString(valueStr, 10)
+
+	packed, err := parsedABI.Pack("is2FARequired", common.HexToAddress(from), value, common.FromHex(data))
+	if err != nil {
+		return false, fmt.Errorf("pack args failed: %w", err)
+	}
+
+	contractAddr := common.HexToAddress(to)
+	msg := ethereum.CallMsg{To: &contractAddr, Data: packed}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return false, fmt.Errorf("CallContract failed: %w", err)
+	}
+
+	var out []interface{}
+	if err := parsedABI.UnpackIntoInterface(&out, "is2FARequired", res); err != nil {
+		return false, fmt.Errorf("unpack failed: %w", err)
+	}
+
+	required, ok := out[0].(bool)
+	if !ok {
+		return false, fmt.Errorf("unexpected return type")
+	}
+
+	return required, nil
 }
 
 func verifyRawSignature(msgHash common.Hash, expectedAddr string, v interface{}, r interface{}, s interface{}) (bool, error) {
@@ -1365,6 +1680,8 @@ func withCORS(h http.Handler) http.Handler {
 
 // ---------- MAIN ----------
 func main() {
+	myRelayerPrivKey = loadRelayerPrivKey()
+
 	if len(os.Args) < 3 {
 		fmt.Println("Usage: go run node.go <p2pPort> <rpcPort>")
 		return
