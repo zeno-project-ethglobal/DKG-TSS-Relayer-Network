@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,21 +128,110 @@ var (
 	approvals      = make(map[string][]BatchApproval) // key = batchHash
 	ISSUER_ADDRESS = "0x7678D7C93aa0A43A8eE8Bbb782D6a42bc80f15CA"
 
-	RELAYER_CONTRACT = "0x29515e3A4F2393c06264Fe406083bAF8F4Cc8210"
-	// ZENOPAY_CONTRACT = "0xBe0633404b3Ea76A89786ea072c989b2b31b8d9c"
+	RELAYER_CONTRACT = "0xC3B63236Ee201855414f04999c425313F6EC1cCf"
+	// ZENOPAY_CONTRACT = "0x085D2c5c267EA2a40902aeA08385059032f881B8"
 	myRelayerPrivKey *ecdsa.PrivateKey
+
+	confirmedLock    sync.Mutex
+	confirmedBatches = make(map[string]bool)
+
+	relayerIntervalBlocks int64 = 6 // change if you want longer/shorter rounds
+	lastRoundActed        int64 = -1
+	relayerRoundMu        sync.Mutex
 )
 
-func loadRelayerPrivKey() *ecdsa.PrivateKey {
-	pkHex := os.Getenv("RELAYER_PRIVKEY")
-	if pkHex == "" {
-		log.Fatal("RELAYER_PRIVKEY not set in environment")
+// getActiveRosterSorted returns a deterministic roster: [selfId + peers], sorted by ID
+func getActiveRosterSorted() []string {
+	peerMapLock.Lock()
+	roster := make([]string, 0, len(peerMap)+1)
+	roster = append(roster, selfId)
+	for id := range peerMap {
+		if id == selfId {
+			continue
+		}
+		roster = append(roster, id)
 	}
-	key, err := crypto.HexToECDSA(strings.TrimPrefix(pkHex, "0x"))
-	if err != nil {
-		log.Fatalf("Failed to parse private key: %v", err)
+	peerMapLock.Unlock()
+	sort.Strings(roster)
+	return roster
+}
+
+// deriveRoundFromBlock computes the round index from a block number
+func deriveRoundFromBlock(blockNumber int64) int64 {
+	if relayerIntervalBlocks <= 0 {
+		relayerIntervalBlocks = 6
 	}
-	return key
+	return blockNumber / relayerIntervalBlocks
+}
+
+// selectLeader deterministically picks a leader from the sorted roster using a seed
+func selectLeader(roster []string, seed []byte) string {
+	if len(roster) == 0 {
+		return ""
+	}
+	// Convert seed to big.Int and mod by roster length
+	s := new(big.Int).SetBytes(seed)
+	idx := new(big.Int).Mod(s, big.NewInt(int64(len(roster)))).Int64()
+	return roster[idx]
+}
+
+// buildSeed mixes block hash and round index for stability within the round
+func buildSeed(blockHash common.Hash, round int64) []byte {
+	// seed = keccak256(blockHash || round)
+	h := sha3.NewLegacyKeccak256()
+	h.Write(blockHash.Bytes())
+	rb := big.NewInt(round).Bytes()
+	h.Write(rb)
+	return h.Sum(nil)
+}
+
+// applyBatchConfirmed centralizes mempool cleanup and de-dup confirms
+func applyBatchConfirmed(batchHash string, txHashesIface []interface{}) {
+	confirmedLock.Lock()
+	if confirmedBatches[batchHash] { // already applied
+		confirmedLock.Unlock()
+		fmt.Println("ℹ️ BATCH_CONFIRMED already applied for", batchHash)
+		return
+	}
+	confirmedBatches[batchHash] = true
+	confirmedLock.Unlock()
+
+	// Build set of tx hashes to remove
+	hashSet := make(map[string]bool)
+	for _, h := range txHashesIface {
+		if hs, ok := h.(string); ok {
+			hashSet[hs] = true
+		}
+	}
+
+	// Load mempool
+	mem := []map[string]interface{}{}
+	data, _ := os.ReadFile(mempoolFile)
+	if len(data) > 0 {
+		_ = json.Unmarshal(data, &mem)
+	}
+
+	// Normalize and filter
+	before := len(mem)
+	filtered := []map[string]interface{}{}
+	for _, entry := range mem {
+		var tx map[string]interface{}
+		if inner, ok := entry["tx"].(map[string]interface{}); ok {
+			tx = inner
+		} else {
+			tx = entry
+		}
+		h := computeTxHash(tx)
+		if !hashSet[h] {
+			filtered = append(filtered, entry) // keep original entry (tx+signature)
+		}
+	}
+
+	out, _ := json.MarshalIndent(filtered, "", "  ")
+	_ = os.WriteFile(mempoolFile, out, 0644)
+
+	fmt.Printf("🧹 Removed %d txs from mempool after BATCH_CONFIRMED %s (remaining %d)\n",
+		before-len(filtered), batchHash, len(filtered))
 }
 
 // ---------- File Persistence ----------
@@ -286,6 +376,24 @@ func startP2PServer(port string) {
 			continue
 		}
 		go handleP2PConnection(conn)
+	}
+}
+
+func handleP2PConnectionSelf(msg Message) {
+	switch msg.Command {
+	case "BATCH_CONFIRMED":
+		b, _ := json.Marshal(msg.Data)
+		var conf map[string]interface{}
+		_ = json.Unmarshal(b, &conf)
+
+		batchHash, _ := conf["batchHash"].(string)
+		txHashesIface, _ := conf["txHashes"].([]interface{})
+
+		if batchHash == "" || txHashesIface == nil {
+			fmt.Println("⚠️ (self) malformed BATCH_CONFIRMED payload")
+			return
+		}
+		applyBatchConfirmed(batchHash, txHashesIface)
 	}
 }
 
@@ -513,45 +621,16 @@ func handleP2PConnection(conn net.Conn) {
 		b, _ := json.Marshal(msg.Data)
 		var conf map[string]interface{}
 		_ = json.Unmarshal(b, &conf)
-		batchHash := conf["batchHash"].(string)
 
-		// sanity: check we saw/approved this hash
-		if _, ok := approvals[batchHash]; !ok {
-			fmt.Println("⚠️ Got BATCH_CONFIRMED for unknown hash", batchHash)
+		batchHash, _ := conf["batchHash"].(string)
+		txHashesIface, _ := conf["txHashes"].([]interface{})
+
+		if batchHash == "" || txHashesIface == nil {
+			fmt.Println("⚠️ malformed BATCH_CONFIRMED payload")
 			return
 		}
 
-		txHashesIface := conf["txHashes"].([]interface{})
-		txs := []map[string]interface{}{}
-		for _, h := range txHashesIface {
-			// just store as hash list to remove
-			txs = append(txs, map[string]interface{}{"hash": h.(string)})
-		}
-
-		// load mempool and filter
-		mem := []map[string]interface{}{}
-		data, _ := os.ReadFile(mempoolFile)
-		if len(data) > 0 {
-			_ = json.Unmarshal(data, &mem)
-		}
-
-		hashSet := make(map[string]bool)
-		for _, h := range txHashesIface {
-			hashSet[h.(string)] = true
-		}
-
-		filtered := []map[string]interface{}{}
-		for _, tx := range mem {
-			h := computeTxHash(tx)
-			if !hashSet[h] {
-				filtered = append(filtered, tx)
-			}
-		}
-		out, _ := json.MarshalIndent(filtered, "", "  ")
-		_ = os.WriteFile(mempoolFile, out, 0644)
-
-		fmt.Printf("🧹 Removed %d txs from mempool after BATCH_CONFIRMED %s\n", len(txHashesIface), batchHash)
-
+		applyBatchConfirmed(batchHash, txHashesIface)
 	case "PASSWORD_RECOVERY":
 		b, _ := json.Marshal(msg.Data)
 		rec := map[string]interface{}{}
@@ -616,7 +695,7 @@ func computeBatchHash(items []map[string]interface{}) string {
 }
 
 func relayBatchToChain(batch []map[string]interface{}, contractAddr string, privKey *ecdsa.PrivateKey) error {
-	client, err := ethclient.Dial("https://sepolia.infura.io/v3/<YOUR_KEY>")
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
 	if err != nil {
 		return err
 	}
@@ -691,17 +770,32 @@ func relayBatchToChain(batch []map[string]interface{}, contractAddr string, priv
 	return client.SendTransaction(context.Background(), signedTx)
 }
 
-func getRelayerABI() (abi.ABI, error) {
-	data, err := os.ReadFile("./abi/relayercontract.json")
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to read ABI file: %w", err)
-	}
+var relayerABI = `[{
+	"inputs": [{
+		"components": [
+			{"internalType":"address","name":"from","type":"address"},
+			{"internalType":"address","name":"to","type":"address"},
+			{"internalType":"uint256","name":"value","type":"uint256"},
+			{"internalType":"bytes","name":"data","type":"bytes"},
+			{"internalType":"uint8","name":"v","type":"uint8"},
+			{"internalType":"bytes32","name":"r","type":"bytes32"},
+			{"internalType":"bytes32","name":"s","type":"bytes32"}
+		],
+		"internalType":"struct Tx[]",
+		"name":"txs",
+		"type":"tuple[]"
+	}],
+	"name":"sendBatch",
+	"outputs":[],
+	"stateMutability":"nonpayable",
+	"type":"function"
+}]`
 
-	parsedABI, err := abi.JSON(strings.NewReader(string(data)))
+func getRelayerABI() (abi.ABI, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(relayerABI))
 	if err != nil {
 		return abi.ABI{}, fmt.Errorf("failed to parse ABI: %w", err)
 	}
-
 	return parsedABI, nil
 }
 
@@ -711,87 +805,109 @@ func signBatchHash(hash string) string {
 	return "0x" + hex.EncodeToString(h.Sum(nil))
 }
 
-// ---------- Relayer Flow ----------
-func startRelayer() {
-	ticker := time.NewTicker(10 * time.Second)
-	for range ticker.C {
-		roundCounter++
+// Deterministic relayer selection based on blockchain
+func selectRelayerFromBlock(stakes map[string]int, blockHash common.Hash) string {
+	total := 0
+	for _, s := range stakes {
+		total += s
+	}
+	if total == 0 {
+		return ""
+	}
 
-		if roundCounter/2 == 0 {
-			approvalLock.Lock()
-			approvals = make(map[string][]BatchApproval)
-			approvalLock.Unlock()
+	// Use blockHash as randomness
+	seed := new(big.Int).SetBytes(blockHash.Bytes())
+	r := int(seed.Int64() % int64(total))
+
+	cumulative := 0
+	for id, s := range stakes {
+		cumulative += s
+		if r < cumulative {
+			return id
+		}
+	}
+	return ""
+}
+
+// startRelayer deterministically selects a leader based on chain state and relays batches
+func startRelayer() {
+	// Reuse a single client
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	if err != nil {
+		log.Fatal("❌ Cannot connect to Polygon Amoy:", err)
+	}
+	// NOTE: do not defer client.Close(); we keep it for the life of the process
+
+	ticker := time.NewTicker(4 * time.Second) // tick frequently; leader acts once per round
+	for range ticker.C {
+		// 1) Read latest header → compute round + seed
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		header, err := client.HeaderByNumber(ctx, nil)
+		cancel()
+		if err != nil || header == nil {
+			fmt.Println("⚠️ Could not fetch block header:", err)
+			continue
 		}
 
-		stakes := loadStakeData()
-		leader := selectRelayer(stakes, roundCounter)
+		round := deriveRoundFromBlock(header.Number.Int64())
+		seed := buildSeed(header.Hash(), round)
+		roster := getActiveRosterSorted()
+		leader := selectLeader(roster, seed)
 
-		fmt.Println("🎲 Round", roundCounter, "— selected relayer:", leader)
+		fmt.Printf("🎲 Round %d (blk %s) — leader=%s roster=%v\n",
+			round, header.Number.String(), leader, roster)
 
 		if leader != selfId {
-			fmt.Println("🛡️ Acting as verifier this round")
+			// Verifier role — nothing to do except wait for BATCH_CONFIRMED
 			continue
 		}
 
-		// Relayer role
+		// Ensure we act only once per round
+		relayerRoundMu.Lock()
+		if lastRoundActed == round {
+			relayerRoundMu.Unlock()
+			continue
+		}
+		lastRoundActed = round
+		relayerRoundMu.Unlock()
+
+		// 2) Build batch (up to 5 tx)
 		batch := loadMempoolBatch(5)
-
 		if len(batch) == 0 {
+			fmt.Println("ℹ️ No txs in mempool to relay for this round")
 			continue
 		}
+
+		// 3) Relay on-chain
 		hash := computeBatchHash(batch)
-		prop := BatchProposal{
-			Round:      roundCounter,
-			BatchNonce: batchNonce + 1,
-			Items:      batch,
-			BatchHash:  hash,
-			Relayer:    selfId,
+		fmt.Println("🚚 Relaying batch", hash, "with", len(batch), "txs")
+
+		if err := relayBatchToChain(batch, RELAYER_CONTRACT, myRelayerPrivKey); err != nil {
+			fmt.Println("❌ Relay failed:", err)
+			// allow retry next round; do not mark confirmed
+			continue
+		}
+		fmt.Println("✅ Batch relayed to contract:", hash)
+
+		// 4) Build tx hash list
+		txHashes := make([]string, 0, len(batch))
+		for _, tx := range batch {
+			txHashes = append(txHashes, computeTxHash(tx))
 		}
 
-		// Broadcast proposal
+		// 5) Broadcast BATCH_CONFIRMED to peers
+		confirmMsg := map[string]interface{}{
+			"batchHash": hash,
+			"txHashes":  txHashes,
+		}
+		peerMapLock.Lock()
 		for _, addr := range peerMap {
-			sendMessage(addr, Message{Command: "BATCH_PROPOSED", Data: prop})
+			sendMessage(addr, Message{Command: "BATCH_CONFIRMED", Data: confirmMsg})
 		}
-		fmt.Println("📢 Proposed batch", hash)
+		peerMapLock.Unlock()
 
-		// Wait for approvals
-		time.Sleep(5 * time.Second)
-
-		approvalLock.Lock()
-		sigs := approvals[hash]
-		approvalLock.Unlock()
-
-		if len(sigs) >= 1 { // TODO: quorum
-			fmt.Println("✅ Got approvals, submitting batch", hash)
-			batchNonce++
-
-			// remove from local mempool
-			removeTxsFromMempool(batch)
-
-			// broadcast confirmation to verifiers
-			txHashes := []string{}
-			for _, tx := range batch {
-				txHashes = append(txHashes, computeTxHash(tx))
-			}
-			confirmMsg := map[string]interface{}{
-				"batchHash": hash,
-				"txHashes":  txHashes,
-			}
-			for _, addr := range peerMap {
-				sendMessage(addr, Message{Command: "BATCH_CONFIRMED", Data: confirmMsg})
-			}
-
-			// TODO: Call on-chain contract here
-			err := relayBatchToChain(batch, RELAYER_CONTRACT, myRelayerPrivKey)
-			if err != nil {
-				fmt.Println("❌ Relay failed:", err)
-			} else {
-				fmt.Println("✅ Batch relayed to contract")
-			}
-
-		} else {
-			fmt.Println("❌ Not enough approvals, skipping batch", hash)
-		}
+		// 6) Apply locally via same path (ensures identical logic)
+		handleP2PConnectionSelf(Message{Command: "BATCH_CONFIRMED", Data: confirmMsg})
 	}
 }
 
@@ -852,12 +968,32 @@ func loadMempoolBatch(n int) []map[string]interface{} {
 		_ = json.Unmarshal(data, &mem)
 	}
 	if len(mem) == 0 {
-		return []map[string]interface{}{} // guarantee truly empty slice
+		return []map[string]interface{}{}
 	}
-	if len(mem) > n {
-		mem = mem[:n]
+
+	clean := []map[string]interface{}{}
+	for _, entry := range mem {
+		if tx, ok := entry["tx"].(map[string]interface{}); ok {
+			// preserve both tx + signature
+			merged := map[string]interface{}{
+				"from":  tx["from"],
+				"to":    tx["to"],
+				"value": tx["value"],
+				"data":  tx["data"],
+			}
+			if sig, ok := entry["signature"].(map[string]interface{}); ok {
+				merged["signature"] = sig
+			}
+			clean = append(clean, merged)
+		} else {
+			clean = append(clean, entry)
+		}
 	}
-	return mem
+
+	if len(clean) > n {
+		clean = clean[:n]
+	}
+	return clean
 }
 
 func finalizeSignature() {
@@ -1501,15 +1637,28 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// callIs2FARequired queries the smart contract for 2FA requirement
+var is2FARequiredAbi = `[{
+	"inputs": [
+		{"internalType": "address", "name": "from", "type": "address"},
+		{"internalType": "uint256", "name": "value", "type": "uint256"},
+		{"internalType": "bytes", "name": "data", "type": "bytes"}
+	],
+	"name": "is2FARequired",
+	"outputs": [
+		{"internalType": "bool", "name": "", "type": "bool"}
+	],
+	"stateMutability": "view",
+	"type": "function"
+}]`
+
 func callIs2FARequired(from string, valueStr string, data string, to string) (bool, error) {
-	client, err := ethclient.Dial("https://sepolia.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
 	if err != nil {
 		return false, fmt.Errorf("ethclient.Dial failed: %w", err)
 	}
 	defer client.Close()
 
-	parsedABI, err := abi.JSON(strings.NewReader(contractABI))
+	parsedABI, err := abi.JSON(strings.NewReader(is2FARequiredAbi))
 	if err != nil {
 		return false, fmt.Errorf("parse ABI failed: %w", err)
 	}
@@ -1517,6 +1666,7 @@ func callIs2FARequired(from string, valueStr string, data string, to string) (bo
 	value := new(big.Int)
 	value.SetString(valueStr, 10)
 
+	// Encode the call
 	packed, err := parsedABI.Pack("is2FARequired", common.HexToAddress(from), value, common.FromHex(data))
 	if err != nil {
 		return false, fmt.Errorf("pack args failed: %w", err)
@@ -1533,14 +1683,10 @@ func callIs2FARequired(from string, valueStr string, data string, to string) (bo
 		return false, fmt.Errorf("CallContract failed: %w", err)
 	}
 
-	var out []interface{}
-	if err := parsedABI.UnpackIntoInterface(&out, "is2FARequired", res); err != nil {
+	// Directly unpack into a bool
+	var required bool
+	if err := parsedABI.UnpackIntoInterface(&required, "is2FARequired", res); err != nil {
 		return false, fmt.Errorf("unpack failed: %w", err)
-	}
-
-	required, ok := out[0].(bool)
-	if !ok {
-		return false, fmt.Errorf("unexpected return type")
 	}
 
 	return required, nil
@@ -1641,28 +1787,6 @@ func loadStakeData() map[string]int {
 	return stakes
 }
 
-// ---------- Relayer Selection ----------
-func selectRelayer(stakes map[string]int, round int64) string {
-	total := 0
-	for _, s := range stakes {
-		total += s
-	}
-	if total == 0 {
-		return ""
-	}
-
-	// deterministic seed = round number
-	r := int(round % int64(total))
-	cumulative := 0
-	for id, s := range stakes {
-		cumulative += s
-		if r < cumulative {
-			return id
-		}
-	}
-	return ""
-}
-
 func withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1680,7 +1804,13 @@ func withCORS(h http.Handler) http.Handler {
 
 // ---------- MAIN ----------
 func main() {
-	myRelayerPrivKey = loadRelayerPrivKey()
+	privKeyHex := "0x95d50f37fbf780456c47be9ce87d68ae9f85337c150699d494f1d69629699c26"
+
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(privKeyHex, "0x"))
+	if err != nil {
+		log.Fatalf("❌ Failed to parse private key: %v", err)
+	}
+	myRelayerPrivKey = key
 
 	if len(os.Args) < 3 {
 		fmt.Println("Usage: go run node.go <p2pPort> <rpcPort>")
