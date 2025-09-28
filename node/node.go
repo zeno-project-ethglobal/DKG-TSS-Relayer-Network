@@ -10,9 +10,9 @@ import (
 	"net"
 
 	"os/signal"
+	"syscall"
 
 	"sync"
-	"syscall"
 
 	// "vendor/golang.org/x/net/idna"
 
@@ -695,7 +695,7 @@ func computeBatchHash(items []map[string]interface{}) string {
 }
 
 func relayBatchToChain(batch []map[string]interface{}, contractAddr string, privKey *ecdsa.PrivateKey) error {
-	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/3624a46688454a588e0d30103a3a4520")
 	if err != nil {
 		return err
 	}
@@ -832,13 +832,13 @@ func selectRelayerFromBlock(stakes map[string]int, blockHash common.Hash) string
 // startRelayer deterministically selects a leader based on chain state and relays batches
 func startRelayer() {
 	// Reuse a single client
-	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/3624a46688454a588e0d30103a3a4520")
 	if err != nil {
 		log.Fatal("❌ Cannot connect to Polygon Amoy:", err)
 	}
 	// NOTE: do not defer client.Close(); we keep it for the life of the process
 
-	ticker := time.NewTicker(4 * time.Second) // tick frequently; leader acts once per round
+	ticker := time.NewTicker(60 * time.Second) // tick frequently; leader acts once per round
 	for range ticker.C {
 		// 1) Read latest header → compute round + seed
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1652,7 +1652,7 @@ var is2FARequiredAbi = `[{
 }]`
 
 func callIs2FARequired(from string, valueStr string, data string, to string) (bool, error) {
-	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/e83d23f934004673b6cd799489e9382e")
+	client, err := ethclient.Dial("https://polygon-amoy.infura.io/v3/3624a46688454a588e0d30103a3a4520")
 	if err != nil {
 		return false, fmt.Errorf("ethclient.Dial failed: %w", err)
 	}
@@ -1761,7 +1761,7 @@ func startRPCServer(port string) {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ---------- Cleanup ----------
+// // ---------- Cleanup ----------
 func cleanupOnExit() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -1769,7 +1769,7 @@ func cleanupOnExit() {
 		<-c
 		fmt.Printf("🧹 Cleaning up %s %s...\n", peersFile, usersFile)
 		os.Remove(peersFile)
-		os.Remove(usersFile)
+		// os.Remove(usersFile)
 		os.Remove(mempoolFile)
 		os.Remove(stakeFile)
 		os.Exit(0)
@@ -1787,18 +1787,26 @@ func loadStakeData() map[string]int {
 	return stakes
 }
 
-func withCORS(h http.Handler) http.Handler {
+func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// Handle preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		h.ServeHTTP(w, r)
+		next.ServeHTTP(w, r)
 	})
 }
 
